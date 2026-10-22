@@ -186,19 +186,23 @@ def main() -> int:
 
     def send_dual(can_id: int, payload: bytes) -> int:
         testpoints.cmdtx_on()
+        tx_time_ns = monotonic_ns()
 
         try:
-            tx_time_ns = monotonic_ns()
-
-            for _, bus, pulse_can_tx in buses:
+            for interface_name, bus, pulse_can_tx in buses:
                 message = can.Message(
                     arbitration_id=can_id,
                     data=payload,
                     is_extended_id=False,
                 )
-                pulse_can_tx()
-                bus.send(message, timeout=0.005)
-
+                try:
+                    pulse_can_tx()
+                    bus.send(message, timeout=0.005)
+                except can.CanError as error:
+                    print(
+                        f"{interface_name} TX failed for 0x{can_id:03X}: {error}",
+                        file=sys.stderr,
+                    )
             return tx_time_ns
         finally:
             testpoints.cmdtx_off()
