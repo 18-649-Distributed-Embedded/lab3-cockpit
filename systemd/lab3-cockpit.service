@@ -1,0 +1,18 @@
+[Unit]
+Description=Lab 3 dual-CAN cockpit gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/lab3-cockpit
+
+ExecStartPre=/home/pi/lab3-cockpit/scripts/setup_can.sh 500000
+ExecStart=/usr/bin/python3 /home/pi/lab3-cockpit/src/cockpit.py --env /home/pi/lab3-cockpit/config/cockpit.env
+
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
