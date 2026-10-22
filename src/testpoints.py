@@ -82,13 +82,37 @@ class TestPoints:
         timer.start()
 
     def pulse_udprx(self) -> None:
-        self._pulse(self.udprx)
+        self.udprx_on()
+
+    def udprx_on(self) -> None:
+        if self.enabled and self.udprx is not None:
+            self.udprx.on()
+
+    def udprx_off(self) -> None:
+        if self.enabled and self.udprx is not None:
+            self.udprx.off()
 
     def pulse_cantxa(self) -> None:
-        self._pulse(self.cantxa)
+        self.cantxa_on()
+
+    def cantxa_on(self) -> None:
+        if self.enabled and self.cantxa is not None:
+            self.cantxa.on()
+
+    def cantxa_off(self) -> None:
+        if self.enabled and self.cantxa is not None:
+            self.cantxa.off()
 
     def pulse_cantxb(self) -> None:
-        self._pulse(self.cantxb)
+        self.cantxb_on()
+
+    def cantxb_on(self) -> None:
+        if self.enabled and self.cantxb is not None:
+            self.cantxb.on()
+
+    def cantxb_off(self) -> None:
+        if self.enabled and self.cantxb is not None:
+            self.cantxb.off()
 
     def cmdtx_on(self) -> None:
         if self.enabled and self.cmdtx is not None:

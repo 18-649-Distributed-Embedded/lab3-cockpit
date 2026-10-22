@@ -9,6 +9,8 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import can
 
 from can_catalog import (
@@ -108,6 +110,7 @@ def main() -> int:
     can_b_name = os.getenv("CAN_B", "can1")
 
     heartbeat_period_s = env_float("HEARTBEAT_PERIOD_S", 0.020)
+    control_period_s = env_float("CONTROL_PERIOD_S", 0.020)
     blink_toggle_period_s = env_float("BLINK_TOGGLE_PERIOD_S", 0.500)
     heartbeat_timeout_s = env_float("HEARTBEAT_TIMEOUT_S", 0.060)
     testpoint_pulse_s = env_float("TESTPOINT_PULSE_S", 0.001)
@@ -131,28 +134,24 @@ def main() -> int:
     udp_socket.bind((udp_bind, udp_port))
     udp_socket.setblocking(False)
 
-    bus_a = None
-    bus_b = None
+    open_buses = []
+    for ch_name, pin in ((can_a_name, testpoints.cantxa), (can_b_name, testpoints.cantxb)):
+        try:
+            b = can.Bus(
+                interface="socketcan",
+                channel=ch_name,
+            )
+            open_buses.append((ch_name, b, pin))
+        except (can.CanError, OSError) as error:
+            print(f"Warning: could not open SocketCAN {ch_name}: {error}", file=sys.stderr)
 
-    try:
-        bus_a = can.Bus(
-            interface="socketcan",
-            channel=can_a_name,
-        )
-        bus_b = can.Bus(
-            interface="socketcan",
-            channel=can_b_name,
-        )
-    except can.CanError as error:
-        print(f"cannot open SocketCAN interface: {error}", file=sys.stderr)
+    if not open_buses:
+        print("Error: No SocketCAN interfaces could be opened. Check setup_can.sh.", file=sys.stderr)
         udp_socket.close()
         testpoints.close()
         return 1
 
-    buses = (
-        (can_a_name, bus_a, testpoints.pulse_cantxa),
-        (can_b_name, bus_b, testpoints.pulse_cantxb),
-    )
+    buses = tuple(open_buses)
 
     counters: dict[int, int] = defaultdict(int)
     cockpit_state = CockpitState()
@@ -181,31 +180,38 @@ def main() -> int:
         },
     }
 
+    last_tx_error_time: dict[str, float] = defaultdict(float)
+
     next_heartbeat_time = time.monotonic()
+    next_control_time = time.monotonic()
     next_blink_toggle_time = float("inf")
 
     def send_dual(can_id: int, payload: bytes) -> int:
-        testpoints.cmdtx_on()
         tx_time_ns = monotonic_ns()
 
-        try:
-            for interface_name, bus, pulse_can_tx in buses:
-                message = can.Message(
-                    arbitration_id=can_id,
-                    data=payload,
-                    is_extended_id=False,
-                )
-                try:
-                    pulse_can_tx()
-                    bus.send(message, timeout=0.005)
-                except can.CanError as error:
+        for interface_name, bus, pin in buses:
+            message = can.Message(
+                arbitration_id=can_id,
+                data=payload,
+                is_extended_id=False,
+            )
+            try:
+                if pin is not None and testpoints.enabled:
+                    pin.on()
+                bus.send(message, timeout=0.0)
+            except (can.CanError, OSError) as error:
+                now_err = time.monotonic()
+                if now_err - last_tx_error_time[interface_name] >= 1.0:
                     print(
                         f"{interface_name} TX failed for 0x{can_id:03X}: {error}",
                         file=sys.stderr,
                     )
-            return tx_time_ns
-        finally:
-            testpoints.cmdtx_off()
+                    last_tx_error_time[interface_name] = now_err
+            finally:
+                if pin is not None and testpoints.enabled:
+                    pin.off()
+
+        return tx_time_ns
 
     def send_blink(state: int, phase: int) -> None:
         sequence = next_sequence(counters, CAN_ID_BLINK)
@@ -235,9 +241,13 @@ def main() -> int:
         send_dual(CAN_ID_FAULT, payload)
 
     def send_ctrl() -> None:
-        sequence = next_sequence(counters, CAN_ID_CTRL)
-        payload = make_ctrl(sequence, latest_control)
-        send_dual(CAN_ID_CTRL, payload)
+        testpoints.cmdtx_on()
+        try:
+            sequence = next_sequence(counters, CAN_ID_CTRL)
+            payload = make_ctrl(sequence, latest_control)
+            send_dual(CAN_ID_CTRL, payload)
+        finally:
+            testpoints.cmdtx_off()
 
     print(f"Listening for wheel UDP on {udp_bind}:{udp_port}")
     print(f"Sending Lab 3 CAN traffic on {can_a_name} and {can_b_name}")
@@ -246,25 +256,36 @@ def main() -> int:
         while True:
             now = time.monotonic()
 
-            deadlines = [next_heartbeat_time]
+            deadlines = [next_heartbeat_time, next_control_time]
 
             if blink_state != BLINK_OFF:
                 deadlines.append(next_blink_toggle_time)
 
             timeout = max(0.0, min(deadlines) - now)
 
-            readable, _, _ = select.select(
-                [udp_socket],
-                [],
-                [],
-                timeout,
-            )
+            read_fds = [udp_socket]
+            for _, b, _ in buses:
+                if hasattr(b, "fileno"):
+                    try:
+                        read_fds.append(b.fileno())
+                    except Exception:
+                        pass
 
-            if readable:
+            try:
+                readable, _, _ = select.select(
+                    read_fds,
+                    [],
+                    [],
+                    timeout,
+                )
+            except (OSError, select.error):
+                readable = []
+
+            if udp_socket in readable:
                 while True:
                     try:
                         packet, source = udp_socket.recvfrom(2048)
-                    except BlockingIOError:
+                    except (BlockingIOError, OSError):
                         break
 
                     if len(packet) != udp_packet_size:
@@ -275,6 +296,7 @@ def main() -> int:
                         )
                         continue
 
+                    testpoints.udprx_on()
                     previous_blink_state = blink_state
 
                     try:
@@ -284,6 +306,7 @@ def main() -> int:
                             test_fault_requested,
                         ) = update_from_packet(cockpit_state, packet)
                     except ValueError as error:
+                        testpoints.udprx_off()
                         print(
                             f"UDP packet rejected: {error}",
                             file=sys.stderr,
@@ -291,7 +314,6 @@ def main() -> int:
                         continue
 
                     last_udp_time = time.monotonic()
-                    testpoints.pulse_udprx()
 
                     if args.verbose:
                         print(
@@ -315,6 +337,8 @@ def main() -> int:
                         send_fault(CAN_FAULT_TESTBTN)
 
                     send_ctrl()
+                    testpoints.udprx_off()
+                    next_control_time = time.monotonic() + control_period_s
 
                     if blink_state != previous_blink_state:
                         blink_phase = 1 if blink_state != BLINK_OFF else 0
@@ -329,7 +353,10 @@ def main() -> int:
 
             for interface_name, bus, _ in buses:
                 while True:
-                    message = bus.recv(timeout=0.0)
+                    try:
+                        message = bus.recv(timeout=0.0)
+                    except (can.CanError, OSError):
+                        break
 
                     if message is None:
                         break
@@ -393,6 +420,12 @@ def main() -> int:
                     next_blink_toggle_time = (
                         time.monotonic() + blink_toggle_period_s
                     )
+
+            # Periodic CTRL transmission
+            if now >= next_control_time:
+                send_ctrl()
+                while next_control_time <= now:
+                    next_control_time += control_period_s
 
             bus_a_healthy = any(
                 now - last_peer_heartbeat[can_a_name][can_id]
@@ -461,11 +494,11 @@ def main() -> int:
     finally:
         udp_socket.close()
 
-        if bus_a is not None:
-            bus_a.shutdown()
-
-        if bus_b is not None:
-            bus_b.shutdown()
+        for _, bus, _ in buses:
+            try:
+                bus.shutdown()
+            except Exception:
+                pass
 
         testpoints.close()
 
