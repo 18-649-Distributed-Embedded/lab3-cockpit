@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import struct
+import time
 from dataclasses import dataclass
 
 from can_catalog import Control
@@ -35,6 +36,9 @@ BUTTON_TEST = 6
 TURN_CANCEL_THRESHOLD = 12000
 TURN_CANCEL_RETURN_THRESHOLD = 4000
 
+TEST_DEBOUNCE_S = 0.050
+TEST_DOUBLE_PRESS_S = 0.500
+
 
 @dataclass(frozen=True)
 class WheelState:
@@ -45,7 +49,10 @@ class WheelState:
     buttons: tuple[int, ...]
 
     def button_pressed(self, index: int) -> bool:
-        return 0 <= index < len(self.buttons) and self.buttons[index] != 0
+        return (
+            0 <= index < len(self.buttons)
+            and self.buttons[index] != 0
+        )
 
 
 @dataclass
@@ -61,6 +68,9 @@ class CockpitState:
     right_latched: bool = False
     left_crossed: bool = False
     right_crossed: bool = False
+
+    last_test_edge_time: float | None = None
+    test_pair_start_time: float | None = None
 
 
 def clamp(value: int, low: int, high: int) -> int:
@@ -90,24 +100,18 @@ def map_linear(
 def parse_packet(packet: bytes) -> WheelState:
     if len(packet) != UDP_PACKET_SIZE:
         raise ValueError(
-            f"expected {UDP_PACKET_SIZE}-byte UDP packet, got {len(packet)}"
+            f"expected {UDP_PACKET_SIZE}-byte UDP packet, "
+            f"got {len(packet)}"
         )
 
-    counter = struct.unpack_from("<I", packet, COUNTER_OFFSET)[0]
-    steering_raw = struct.unpack_from("<i", packet, STEER_OFFSET)[0]
-    throttle_raw = struct.unpack_from("<i", packet, THROTTLE_OFFSET)[0]
-    brake_raw = struct.unpack_from("<i", packet, BRAKE_OFFSET)[0]
-
-    buttons = tuple(
-        packet[BUTTONS_OFFSET : BUTTONS_OFFSET + BUTTON_COUNT]
-    )
-
     return WheelState(
-        counter=counter,
-        steering_raw=steering_raw,
-        throttle_raw=throttle_raw,
-        brake_raw=brake_raw,
-        buttons=buttons,
+        counter=struct.unpack_from("<I", packet, COUNTER_OFFSET)[0],
+        steering_raw=struct.unpack_from("<i", packet, STEER_OFFSET)[0],
+        throttle_raw=struct.unpack_from("<i", packet, THROTTLE_OFFSET)[0],
+        brake_raw=struct.unpack_from("<i", packet, BRAKE_OFFSET)[0],
+        buttons=tuple(
+            packet[BUTTONS_OFFSET:BUTTONS_OFFSET + BUTTON_COUNT]
+        ),
     )
 
 
@@ -146,7 +150,10 @@ def normalize_throttle(raw: int) -> int:
         THROTTLE_PRESSED,
     )
 
-    if fraction * abs(THROTTLE_PRESSED - THROTTLE_RELEASED) <= PEDAL_DEADBAND:
+    if (
+        fraction * abs(THROTTLE_PRESSED - THROTTLE_RELEASED)
+        <= PEDAL_DEADBAND
+    ):
         fraction = 0.0
 
     return clamp(round(127 + fraction * 128), 127, 255)
@@ -159,7 +166,10 @@ def normalize_brake(raw: int) -> int:
         BRAKE_PRESSED,
     )
 
-    if fraction * abs(BRAKE_PRESSED - BRAKE_RELEASED) <= PEDAL_DEADBAND:
+    if (
+        fraction * abs(BRAKE_PRESSED - BRAKE_RELEASED)
+        <= PEDAL_DEADBAND
+    ):
         return 0
 
     return 1 if fraction >= 0.10 else 0
@@ -190,29 +200,25 @@ def update_from_packet(
     state.brake = normalize_brake(wheel.brake_raw)
 
     if rising_edge(
-        wheel,
-        state.previous_buttons,
-        BUTTON_LEFT_BLINKER,
+        wheel, state.previous_buttons, BUTTON_LEFT_BLINKER
     ):
         state.blinker = 0 if state.blinker == 1 else 1
         state.left_latched = state.blinker == 1
         state.right_latched = False
         state.left_crossed = False
+        state.right_crossed = False
 
     if rising_edge(
-        wheel,
-        state.previous_buttons,
-        BUTTON_RIGHT_BLINKER,
+        wheel, state.previous_buttons, BUTTON_RIGHT_BLINKER
     ):
         state.blinker = 0 if state.blinker == 2 else 2
         state.right_latched = state.blinker == 2
         state.left_latched = False
+        state.left_crossed = False
         state.right_crossed = False
 
     if rising_edge(
-        wheel,
-        state.previous_buttons,
-        BUTTON_HAZARD,
+        wheel, state.previous_buttons, BUTTON_HAZARD
     ):
         state.blinker = 0 if state.blinker == 3 else 3
         state.left_latched = False
@@ -220,19 +226,30 @@ def update_from_packet(
 
     test_fault_requested = False
 
-    if rising_edge(
-        wheel,
-        state.previous_buttons,
-        BUTTON_TEST,
-    ):
-        state.test_active = not state.test_active
-        test_fault_requested = state.test_active
+    if rising_edge(wheel, state.previous_buttons, BUTTON_TEST):
+        now = time.monotonic()
 
-        if not state.test_active:
-            state.throttle = 127
-            state.steering = 0
-            state.brake = 1
-            state.blinker = 0
+        accepted = (
+            state.last_test_edge_time is None
+            or now - state.last_test_edge_time >= TEST_DEBOUNCE_S
+        )
+
+        if accepted:
+            state.last_test_edge_time = now
+
+            if not state.test_active:
+                state.test_active = True
+                state.test_pair_start_time = now
+                test_fault_requested = True
+            elif (
+                state.test_pair_start_time is not None
+                and now - state.test_pair_start_time
+                <= TEST_DOUBLE_PRESS_S
+            ):
+                state.test_active = False
+                state.test_pair_start_time = None
+            else:
+                state.test_pair_start_time = now
 
     if state.left_latched:
         if wheel.steering_raw <= -TURN_CANCEL_THRESHOLD:
